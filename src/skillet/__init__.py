@@ -41,7 +41,7 @@ from .models import (
     UsageByApiKey,
     UsageSummary,
 )
-from .workflow import SkillSession, SkillWorkflow
+from .session import SkillSession
 
 __all__ = [
     "ActivationPolicy",
@@ -78,7 +78,6 @@ __all__ = [
     "SkillDraft",
     "SkillPackage",
     "SkillSession",
-    "SkillWorkflow",
     "SkilletError",
     "TargetRuntime",
     "TokenUsageSummary",
