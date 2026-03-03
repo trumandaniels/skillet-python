@@ -132,7 +132,7 @@ class Client:
         from skillet import Client
 
         client = Client(
-            api_key="sk_live_AbC...vWx",
+            api_key="sk_live_...",
             bearer_token="your-bearer-token",
         )
 
