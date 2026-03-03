@@ -1,29 +1,57 @@
-name: Trigger SDK doc regeneration
+name: Regenerate skillet docs on SDK merge
 
 on:
   push:
     branches: [main]
     paths:
       - "src/skillet/**"
+      - "pyproject.toml"
 
 jobs:
-  dispatch:
+  regenerate-docs:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
-      - name: Dispatch sdk-updated event to skillet repo
-        uses: actions/github-script@v7
+      - name: Check out skillet repo
+        uses: actions/checkout@v4
         with:
-          # Personal Access Token with `repo` write scope on the skillet repo.
-          # Store it as SKILLET_REPO_PAT in this repository's secrets.
-          github-token: ${{ secrets.SKILLET_REPO_PAT }}
-          script: |
-            await github.rest.repos.createDispatchEvent({
-              owner: 'skilletdev',   // update to your GitHub org
-              repo: 'skillet',
-              event_type: 'sdk-updated',
-              client_payload: {
-                sdk_sha: context.sha,
-                sdk_ref: context.ref,
-              },
-            })
+          repository: skilletdev/skillet
+          token: ${{ secrets.SKILLET_REPO_PAT }}
+          path: skillet
+          ref: main
+
+      - name: Check out skillet-python repo
+        uses: actions/checkout@v4
+        with:
+          path: skillet-python
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install docs build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e skillet/backend/
+          pip install -e skillet-python/
+
+      - name: Regenerate skillet docs artifacts
+        env:
+          SKILLET_PYTHON_REPO: ${{ github.workspace }}/skillet-python
+        run: python skillet/scripts/build_docs_artifacts.py
+
+      - name: Commit regenerated docs artifacts
+        working-directory: ./skillet
+        run: |
+          if git diff --quiet -- docs/api/openapi.json frontend/src/generated/docsReference.json docs/internal/docs-sources.json; then
+            echo "No docs artifact changes."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/api/openapi.json frontend/src/generated/docsReference.json docs/internal/docs-sources.json
+          git commit -m "chore: regenerate docs artifacts from skillet-python [skip ci]"
+          git push origin HEAD:main
