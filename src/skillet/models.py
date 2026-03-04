@@ -7,7 +7,35 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+_ALLOWED_PROVIDER_KEYS = frozenset({
+    "openai", "anthropic", "google", "gemini", "azure", "bedrock",
+})
+_MAX_PROVIDER_KEY_LENGTH = 256
+_MAX_PROVIDER_KEY_COUNT = 5
+
+
+def _validate_model_provider_keys(
+    keys: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if keys is None:
+        return None
+    if len(keys) > _MAX_PROVIDER_KEY_COUNT:
+        raise ValueError(
+            f"model_provider_keys may contain at most {_MAX_PROVIDER_KEY_COUNT} entries"
+        )
+    for name, value in keys.items():
+        if name not in _ALLOWED_PROVIDER_KEYS:
+            raise ValueError(
+                f"Unknown provider key '{name}'. "
+                f"Allowed: {', '.join(sorted(_ALLOWED_PROVIDER_KEYS))}"
+            )
+        if len(value) > _MAX_PROVIDER_KEY_LENGTH:
+            raise ValueError(
+                f"Provider key value for '{name}' exceeds {_MAX_PROVIDER_KEY_LENGTH} characters"
+            )
+    return keys
 
 
 class SkilletModel(BaseModel):
@@ -62,6 +90,22 @@ class PlanTier(StrEnum):
     FREE = "free"
     BUILDER = "builder"
     TEAM_PILOT = "team_pilot"
+
+
+class RunProfile(StrEnum):
+    """Evaluation run profile controlling cost/coverage trade-offs."""
+
+    INTERACTIVE = "interactive"
+    PR = "pr"
+    NIGHTLY = "nightly"
+
+
+class CompareToMode(StrEnum):
+    """Baseline comparison mode for evaluation runs."""
+
+    NONE = "none"
+    LATEST_MAIN = "latest_main"
+    EXPLICIT_BASELINE = "explicit_baseline"
 
 
 class ArtifactFile(SkilletModel):
@@ -385,6 +429,30 @@ class BuildRequest(SkilletModel):
         default=True,
         description="Whether to generate verification check artifacts.",
     )
+    model_provider_keys: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional LLM provider API keys for the model calls Skillet orchestrates. "
+            "Keys are pass-through only: held in memory for this request, never stored or logged. "
+            "Accepted key names: `openai`, `gemini`, `anthropic`, etc."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional model to use for LLM calls during this operation "
+            "(e.g. `gpt-5-nano`, `claude-sonnet-4-20250514`, `gemini-2.0-flash`). "
+            "The provider is inferred from the model name and the corresponding key "
+            "must be present in `model_provider_keys`. "
+            "If omitted, defaults to a Skillet-selected model."
+        ),
+    )
+
+    @field_validator("model_provider_keys")
+    @classmethod
+    def validate_provider_keys(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_model_provider_keys(v)
 
 
 class EvaluateRequest(SkilletModel):
@@ -415,6 +483,65 @@ class EvaluateRequest(SkilletModel):
         default=False,
         description="Run tests with varying discovery hints to measure activation robustness.",
     )
+    suite: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional suite definition or suite reference payload.",
+    )
+    run_profile: RunProfile = Field(
+        default=RunProfile.INTERACTIVE,
+        description="Execution profile controlling cost and coverage.",
+    )
+    compare_to: CompareToMode = Field(
+        default=CompareToMode.NONE,
+        description="Baseline comparison mode for the evaluation run.",
+    )
+    baseline_eval_id: str | None = Field(
+        default=None,
+        description="Required when `compare_to='explicit_baseline'`.",
+    )
+    quality_gate: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional quality gate thresholds for regressions and activation.",
+    )
+    max_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional hard cap on total estimated tokens consumed by the evaluation run.",
+    )
+    max_tool_calls: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional hard cap on total tool invocations across the run.",
+    )
+    max_wall_time_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        description="Optional hard cap on wall-clock runtime for the full evaluation run.",
+    )
+    max_estimated_cost_usd: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Optional conservative upper bound on estimated run cost in USD.",
+    )
+    model_provider_keys: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional LLM provider API keys for the model calls Skillet orchestrates. "
+            "Keys are pass-through only: held in memory for this request, never stored or logged. "
+            "Accepted key names: `openai`, `gemini`, `anthropic`, etc."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional model to use for LLM calls during evaluation runs "
+            "(e.g. `gpt-5-nano`, `claude-sonnet-4-20250514`, `gemini-2.0-flash`). "
+            "The provider is inferred from the model name and the corresponding key "
+            "must be present in `model_provider_keys`. "
+            "If omitted, defaults to a Skillet-selected model."
+        ),
+    )
 
     @field_validator("activation_policies")
     @classmethod
@@ -427,14 +554,51 @@ class EvaluateRequest(SkilletModel):
             raise ValueError("activation_policies must include at least one policy")
         return deduped
 
+    @field_validator("model_provider_keys")
+    @classmethod
+    def validate_provider_keys(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_model_provider_keys(v)
+
+    @model_validator(mode="after")
+    def validate_baseline_fields(self) -> "EvaluateRequest":
+        if (
+            self.compare_to == CompareToMode.EXPLICIT_BASELINE
+            and not self.baseline_eval_id
+        ):
+            raise ValueError(
+                "baseline_eval_id is required when compare_to='explicit_baseline'"
+            )
+        return self
+
     def to_api_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "skill_package": self.skill_package.to_api_payload(),
+            "run_profile": self.run_profile.value,
+            "compare_to": self.compare_to.value,
             "activation_policies": [policy.value for policy in self.activation_policies],
             "bundle_ablation": self.bundle_ablation,
             "length_ablation": self.length_ablation,
             "discovery_ablation": self.discovery_ablation,
         }
+        if self.suite is not None:
+            payload["suite"] = self.suite
+        if self.baseline_eval_id is not None:
+            payload["baseline_eval_id"] = self.baseline_eval_id
+        if self.quality_gate is not None:
+            payload["quality_gate"] = self.quality_gate
+        if self.max_tokens is not None:
+            payload["max_tokens"] = self.max_tokens
+        if self.max_tool_calls is not None:
+            payload["max_tool_calls"] = self.max_tool_calls
+        if self.max_wall_time_seconds is not None:
+            payload["max_wall_time_seconds"] = self.max_wall_time_seconds
+        if self.max_estimated_cost_usd is not None:
+            payload["max_estimated_cost_usd"] = self.max_estimated_cost_usd
+        if self.model_provider_keys is not None:
+            payload["model_provider_keys"] = self.model_provider_keys
+        if self.model is not None:
+            payload["model"] = self.model
+        return payload
 
 
 class BenchmarkTask(SkilletModel):
@@ -540,9 +704,33 @@ class RefineRequest(SkilletModel):
         default=OptimizationTarget.BALANCED,
         description="Objective function: 'delta' maximizes pass-rate improvement, 'activation' maximizes autonomous discovery, 'balanced' optimizes both.",
     )
+    model_provider_keys: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Optional LLM provider API keys for the model calls Skillet orchestrates. "
+            "Keys are pass-through only: held in memory for this request, never stored or logged. "
+            "Accepted key names: `openai`, `gemini`, `anthropic`, etc."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Optional model to use for LLM calls during refinement "
+            "(e.g. `gpt-5-nano`, `claude-sonnet-4-20250514`, `gemini-2.0-flash`). "
+            "The provider is inferred from the model name and the corresponding key "
+            "must be present in `model_provider_keys`. "
+            "If omitted, defaults to a Skillet-selected model."
+        ),
+    )
+
+    @field_validator("model_provider_keys")
+    @classmethod
+    def validate_provider_keys(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_model_provider_keys(v)
 
     def to_api_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "skill_package": self.skill_package.to_api_payload(),
             "proposed_edits": [
                 edit.model_dump(mode="json", exclude_none=True) for edit in self.proposed_edits
@@ -556,20 +744,166 @@ class RefineRequest(SkilletModel):
             "edit_budget": self.edit_budget,
             "optimization_target": self.optimization_target.value,
         }
+        if self.model_provider_keys is not None:
+            payload["model_provider_keys"] = self.model_provider_keys
+        if self.model is not None:
+            payload["model"] = self.model
+        return payload
+
+
+class EvaluationSuiteRef(SkilletModel):
+    """Reference to a repo-managed evaluation suite."""
+
+    suite_id: str | None = None
+    suite_version: str | None = None
+    path: str | None = None
+    description: str | None = None
+    git_ref: str | None = None
+
+
+class EvaluationQualityGate(SkilletModel):
+    """Quality gate thresholds for CI gating."""
+
+    max_regressions: int | None = Field(default=None, ge=0)
+    min_pass_rate_delta_vs_baseline: float | None = None
+    min_activation_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_context_footprint_delta_pct: float | None = None
+
+
+class EvaluationBaseline(SkilletModel):
+    """Baseline reference metadata in an evaluation report."""
+
+    mode: CompareToMode = CompareToMode.NONE
+    status: str = "not_requested"
+    eval_id: str | None = None
+    suite_id: str | None = None
+    suite_version: str | None = None
+    run_profile: RunProfile | None = None
+    git_ref: str | None = None
+
+
+class EvaluationBaselineDeltas(SkilletModel):
+    """Metric deltas versus a resolved baseline."""
+
+    available: bool = False
+    pass_rate_delta_vs_baseline: float = 0.0
+    activation_rate_delta: float = 0.0
+    context_footprint_delta_pct: float = 0.0
+
+
+class EvaluationGateViolation(SkilletModel):
+    """A single quality gate threshold violation."""
+
+    code: str
+    message: str
+    actual: Any | None = None
+    threshold: Any | None = None
+
+
+class EvaluationGateResult(SkilletModel):
+    """Pass/fail result of quality gate evaluation."""
+
+    status: str = "not_evaluated"  # "pass" | "fail" | "not_evaluated"
+    violations: list[EvaluationGateViolation] = Field(default_factory=list)
+
+
+class EvaluationTokenUsage(SkilletModel):
+    """Token consumption breakdown for an evaluation run."""
+
+    input: int = 0
+    output: int = 0
+    total: int = 0
+
+
+class EvaluationCostSummary(SkilletModel):
+    """Budget and cost summary for an evaluation run."""
+
+    estimated_cost_usd: float = 0.0
+    budget_status: str = "not_requested"  # "ok" | "exceeded" | "not_requested"
+    exceeded_dimensions: list[str] = Field(default_factory=list)
+    token_usage: EvaluationTokenUsage = Field(default_factory=EvaluationTokenUsage)
+    tool_calls: int = 0
+    wall_clock_s: float = 0.0
+
+
+class EvaluationStatusCheckPayload(SkilletModel):
+    """CI status check payload for GitHub or similar integrations."""
+
+    name: str
+    conclusion: str  # "success" | "failure" | "neutral"
+    summary: str
+    details_url: str | None = None
+    external_id: str | None = None
+
+
+class EvaluationPullRequestCommentPayload(SkilletModel):
+    """PR comment payload for CI integrations."""
+
+    title: str
+    body_markdown: str
+    sticky_identifier: str
+    needs_attention: bool = False
+
+
+class EvaluationCiSignal(SkilletModel):
+    """CI integration signals derived from an evaluation report."""
+
+    status_check: EvaluationStatusCheckPayload
+    pull_request_comment: EvaluationPullRequestCommentPayload
 
 
 class EvaluationReport(SkilletModel):
     """Returned by ``client.evaluate()``.
 
-    The top-level fields are ``conditions``, ``harness``, ``metrics``, and ``ablations``.
-    Key metrics include ``pass_rate_delta``, ``autonomous_pass_rate_delta``,
-    ``regression_count``, and ``cost_runtime_overhead``.
+    Contains evaluation metrics, baseline deltas, gate results, CI signals,
+    activation diagnostics, regression summary, and cost information.
     """
 
+    eval_id: str | None = None
+    suite_id: str | None = None
+    suite_version: str | None = None
+    git_ref: str | None = None
+    run_profile: RunProfile | None = None
+    compare_to: CompareToMode | None = None
+    quality_gate: EvaluationQualityGate | None = None
+    baseline: EvaluationBaseline | None = None
+    baseline_deltas: EvaluationBaselineDeltas | None = None
+    gate_result: EvaluationGateResult | None = None
+    ci_signal: EvaluationCiSignal | None = None
     conditions: list[str] = Field(default_factory=list, description="Evaluation conditions that were tested.")
     harness: dict[str, Any] = Field(default_factory=dict, description="Benchmark harness configuration used.")
     metrics: dict[str, Any] = Field(default_factory=dict, description="Aggregated evaluation metrics.")
     ablations: dict[str, Any] = Field(default_factory=dict, description="Results from ablation experiments.")
+    policy_metrics: dict[str, Any] = Field(default_factory=dict, description="Per-policy (forced/autonomous) metrics.")
+    marginal_contribution: list[dict[str, Any]] = Field(default_factory=list, description="Per-skill marginal contribution data.")
+    activation_diagnostics: dict[str, Any] = Field(default_factory=dict, description="Activation behavior diagnostics.")
+    regression_summary: dict[str, Any] = Field(default_factory=dict, description="Summary of regressed tasks.")
+    recommended_edits: list[Any] = Field(default_factory=list, description="Suggested edits based on evaluation evidence.")
+    cost_summary: EvaluationCostSummary | None = None
+
+
+class EvaluationJobStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class EvaluationJobSubmission(SkilletModel):
+    """Returned by ``client.submit_evaluation()`` and ``POST /evaluate``."""
+
+    job_id: str
+    status: EvaluationJobStatus = EvaluationJobStatus.PENDING
+    poll_url: str | None = None
+
+
+class EvaluationJob(SkilletModel):
+    """Returned by ``client.get_evaluation_job()`` and ``GET /evaluate/{job_id}``."""
+
+    job_id: str
+    status: EvaluationJobStatus
+    evaluation_report: EvaluationReport | None = None
+    error: str | None = None
 
 
 class RefineResult(SkilletModel):
@@ -658,6 +992,38 @@ class UsageSummary(SkilletModel):
     by_api_key: list[UsageByApiKey] = Field(default_factory=list, description="Per-key usage attribution breakdown.")
     token_totals: TokenUsageSummary = Field(description="Aggregated token consumption across all keys.")
     billing_period_end: datetime | None = Field(description="End of the current billing period, or null for free-tier accounts.")
+
+
+class EvaluationHistoryItem(SkilletModel):
+    """Summary of a single evaluation run from ``/app/evaluations``."""
+
+    eval_id: str = Field(description="Unique identifier for the evaluation run.")
+    suite_id: str = Field(description="Suite identifier evaluated by the run.")
+    suite_version: str | None = Field(default=None, description="Version of the suite, when supplied.")
+    run_profile: str = Field(description="Execution profile, such as `interactive`, `pr`, or `nightly`.")
+    git_ref: str | None = Field(default=None, description="Git reference associated with the run, when supplied.")
+    compare_to: str = Field(description="Requested baseline comparison mode.")
+    status: str = Field(description="Persisted evaluation status for the run.")
+    model: str | None = Field(default=None, description="Model used for the evaluation, when specified.")
+    created_at: datetime = Field(description="Timestamp when the evaluation run was recorded.")
+    conditions: list[str] = Field(default_factory=list, description="Evaluation conditions executed for the run.")
+    pass_rate_delta: float | None = Field(default=None, description="Pass-rate delta achieved by this run.")
+    activation_rate: float | None = Field(default=None, description="Activation rate observed for this run.")
+    regression_count: int = Field(default=0, description="Count of regressed tasks for the run.")
+    context_footprint_delta_pct: float | None = Field(default=None, description="Context-footprint delta percentage versus baseline when available.")
+    token_total: int = Field(default=0, description="Estimated total token usage for the run.")
+    tool_calls: int = Field(default=0, description="Estimated tool calls during the run.")
+    wall_clock_s: float | None = Field(default=None, description="Approximate wall-clock runtime in seconds.")
+    baseline: EvaluationBaseline = Field(default_factory=EvaluationBaseline, description="Resolved baseline metadata for the run.")
+    baseline_deltas: EvaluationBaselineDeltas = Field(default_factory=EvaluationBaselineDeltas, description="Computed deltas versus the baseline.")
+    gate_result: EvaluationGateResult = Field(default_factory=EvaluationGateResult, description="Gate result and violations for the run.")
+    cost_summary: EvaluationCostSummary | None = Field(default=None, description="Budget and cost summary for the run, when available.")
+
+
+class EvaluationHistory(SkilletModel):
+    """Returned by ``client.get_evaluations()``."""
+
+    evaluations: list[EvaluationHistoryItem] = Field(default_factory=list, description="Most recent evaluation runs visible to the authenticated organization.")
 
 
 class SkillDraft(SkilletModel):

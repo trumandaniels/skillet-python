@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -16,6 +18,9 @@ from .models import (
     ApiKeySummary,
     BuildRequest,
     EvaluateRequest,
+    EvaluationHistory,
+    EvaluationJob,
+    EvaluationJobSubmission,
     EvaluationReport,
     IssuedApiKey,
     RefineResult,
@@ -66,12 +71,26 @@ def _raise_for_response(response: httpx.Response) -> None:
 
 def _coerce_build_request(
     corpus_text: str | BuildRequest,
+    *,
+    client_model_provider_keys: dict[str, str] | None = None,
+    client_model: str | None = None,
     **kwargs: Any,
 ) -> BuildRequest:
     if isinstance(corpus_text, BuildRequest):
         if kwargs:
             raise TypeError("Keyword arguments are not supported when passing a request object")
+        updates: dict[str, Any] = {}
+        if corpus_text.model_provider_keys is None and client_model_provider_keys is not None:
+            updates["model_provider_keys"] = client_model_provider_keys
+        if corpus_text.model is None and client_model is not None:
+            updates["model"] = client_model
+        if updates:
+            corpus_text = corpus_text.model_copy(update=updates)
         return corpus_text
+    if "model_provider_keys" not in kwargs and client_model_provider_keys is not None:
+        kwargs["model_provider_keys"] = client_model_provider_keys
+    if "model" not in kwargs and client_model is not None:
+        kwargs["model"] = client_model
     return BuildRequest(corpus_text=corpus_text, **kwargs)
 
 
@@ -85,23 +104,51 @@ def _coerce_skill_package(
 
 def _coerce_evaluate_request(
     skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+    *,
+    client_model_provider_keys: dict[str, str] | None = None,
+    client_model: str | None = None,
     **kwargs: Any,
 ) -> EvaluateRequest:
     if isinstance(skill_package, EvaluateRequest):
         if kwargs:
             raise TypeError("Keyword arguments are not supported when passing a request object")
+        updates: dict[str, Any] = {}
+        if skill_package.model_provider_keys is None and client_model_provider_keys is not None:
+            updates["model_provider_keys"] = client_model_provider_keys
+        if skill_package.model is None and client_model is not None:
+            updates["model"] = client_model
+        if updates:
+            skill_package = skill_package.model_copy(update=updates)
         return skill_package
+    if "model_provider_keys" not in kwargs and client_model_provider_keys is not None:
+        kwargs["model_provider_keys"] = client_model_provider_keys
+    if "model" not in kwargs and client_model is not None:
+        kwargs["model"] = client_model
     return EvaluateRequest(skill_package=_coerce_skill_package(skill_package), **kwargs)
 
 
 def _coerce_refine_request(
     skill_package: SkillPackage | RefineRequest | dict[str, Any],
+    *,
+    client_model_provider_keys: dict[str, str] | None = None,
+    client_model: str | None = None,
     **kwargs: Any,
 ) -> RefineRequest:
     if isinstance(skill_package, RefineRequest):
         if kwargs:
             raise TypeError("Keyword arguments are not supported when passing a request object")
+        updates: dict[str, Any] = {}
+        if skill_package.model_provider_keys is None and client_model_provider_keys is not None:
+            updates["model_provider_keys"] = client_model_provider_keys
+        if skill_package.model is None and client_model is not None:
+            updates["model"] = client_model
+        if updates:
+            skill_package = skill_package.model_copy(update=updates)
         return skill_package
+    if "model_provider_keys" not in kwargs and client_model_provider_keys is not None:
+        kwargs["model_provider_keys"] = client_model_provider_keys
+    if "model" not in kwargs and client_model is not None:
+        kwargs["model"] = client_model
     return RefineRequest(skill_package=_coerce_skill_package(skill_package), **kwargs)
 
 
@@ -126,6 +173,10 @@ class Client:
         http_client: Optional injected ``httpx.Client`` for tests or advanced
             transport control.  When provided, the caller is responsible for
             closing it.
+        model_provider_keys: Optional per-client provider API keys passed
+            through on every pipeline call unless overridden per request.
+        model: Optional default model passed through on every pipeline call
+            unless overridden per request.
 
     Example:
         ```python
@@ -150,9 +201,13 @@ class Client:
         base_url: str = "https://api.skillet.dev",
         timeout: float = 30.0,
         http_client: httpx.Client | None = None,
+        model_provider_keys: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.bearer_token = bearer_token
+        self.model_provider_keys = model_provider_keys
+        self.model = model
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(
             base_url=base_url.rstrip("/"),
@@ -161,6 +216,20 @@ class Client:
         )
 
     def close(self) -> None:
+        """Close the underlying ``httpx.Client`` when this instance owns it.
+
+        If you injected a custom ``http_client``, this method is a no-op and the
+        caller remains responsible for cleaning it up.
+
+        Example:
+            ```python
+            client = Client(api_key="sk_live_...")
+            try:
+                package = client.build("Your corpus text here...")
+            finally:
+                client.close()
+            ```
+        """
         if self._owns_client:
             self._client.close()
 
@@ -220,7 +289,8 @@ class Client:
                 keyword arguments are not accepted.
             **kwargs: Keyword arguments forwarded to ``BuildRequest``.  Accepted
                 keys: ``overlap_ratio``, ``target_runtime``, ``bundle_target``,
-                ``length_profile``, ``emit_scripts``, ``emit_checks``.
+                ``length_profile``, ``emit_scripts``, ``emit_checks``,
+                ``model_provider_keys``, ``model``.
 
         Returns:
             A ``SkillPackage`` containing the compiled skills, bundle manifest,
@@ -235,18 +305,26 @@ class Client:
             )
             ```
         """
-        request = _coerce_build_request(corpus_text, **kwargs)
+        request = _coerce_build_request(
+            corpus_text,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = self._request_json(
             "POST",
             "/build",
             headers=self._pipeline_headers(),
-            json_body=request.model_dump(mode="json"),
+            json_body=request.model_dump(mode="json", exclude_none=True),
         )
         return SkillPackage.from_build_response(response)
 
     def evaluate(
         self,
         skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        *,
+        poll_interval: float = 1.0,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> EvaluationReport:
         """Evaluate a previously built package against the benchmark harness.
@@ -260,7 +338,11 @@ class Client:
                 ``EvaluateRequest``, keyword arguments are not accepted.
             **kwargs: Keyword arguments forwarded to ``EvaluateRequest``.  Accepted
                 keys: ``activation_policies``, ``bundle_ablation``,
-                ``length_ablation``, ``discovery_ablation``.
+                ``length_ablation``, ``discovery_ablation``, ``suite``,
+                ``run_profile``, ``compare_to``, ``baseline_eval_id``,
+                ``quality_gate``, ``max_tokens``, ``max_tool_calls``,
+                ``max_wall_time_seconds``, ``max_estimated_cost_usd``,
+                ``model_provider_keys``, ``model``.
 
         Returns:
             An ``EvaluationReport`` with pass-rate delta, regression count,
@@ -276,14 +358,127 @@ class Client:
             )
             ```
         """
-        request = _coerce_evaluate_request(skill_package, **kwargs)
+        request = _coerce_evaluate_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = self._request_json(
             "POST",
             "/evaluate",
             headers=self._pipeline_headers(),
             json_body=request.to_api_payload(),
         )
-        return EvaluationReport.model_validate(response["evaluation_report"])
+        if isinstance(response, dict) and "evaluation_report" in response:
+            return EvaluationReport.model_validate(response["evaluation_report"])
+        submission = EvaluationJobSubmission.model_validate(response)
+        return self.wait_for_evaluation(
+            submission.job_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+
+    def submit_evaluation(
+        self,
+        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        **kwargs: Any,
+    ) -> EvaluationJobSubmission:
+        """Submit an evaluation job without waiting for completion.
+
+        Use this when you want explicit control over polling, background job
+        tracking, or external orchestration.
+
+        Args:
+            skill_package: A ``SkillPackage``, ``EvaluateRequest``, or raw
+                ``dict`` payload to evaluate.
+            **kwargs: Keyword arguments forwarded to ``EvaluateRequest``.
+
+        Returns:
+            An ``EvaluationJobSubmission`` containing the queued ``job_id``.
+
+        Example:
+            ```python
+            submission = client.submit_evaluation(
+                package,
+                activation_policies=["forced", "autonomous"],
+            )
+            print(submission.job_id)
+            ```
+        """
+        request = _coerce_evaluate_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
+        response = self._request_json(
+            "POST",
+            "/evaluate",
+            headers=self._pipeline_headers(),
+            json_body=request.to_api_payload(),
+        )
+        return EvaluationJobSubmission.model_validate(response)
+
+    def get_evaluation_job(self, job_id: str) -> EvaluationJob:
+        """Fetch the current state of an evaluation job.
+
+        Args:
+            job_id: Identifier returned by ``submit_evaluation()``.
+
+        Returns:
+            An ``EvaluationJob`` with status, error details, and report payload
+            when the job has completed.
+
+        Example:
+            ```python
+            job = client.get_evaluation_job("evaljob_123")
+            print(job.status)
+            ```
+        """
+        response = self._request_json(
+            "GET",
+            f"/evaluate/{job_id}",
+            headers=self._pipeline_headers(),
+        )
+        return EvaluationJob.model_validate(response)
+
+    def wait_for_evaluation(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 1.0,
+        timeout: float | None = None,
+    ) -> EvaluationReport:
+        """Poll an evaluation job until it completes or fails.
+
+        Args:
+            job_id: Identifier returned by ``submit_evaluation()``.
+            poll_interval: Seconds to wait between status checks.
+            timeout: Optional maximum total wait time in seconds.
+
+        Returns:
+            The completed ``EvaluationReport``.
+
+        Example:
+            ```python
+            submission = client.submit_evaluation(package)
+            report = client.wait_for_evaluation(submission.job_id, poll_interval=2.0)
+            print(report.metrics["pass_rate_delta"])
+            ```
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise ApiError(f"Timed out while waiting for evaluation job {job_id}")
+            job = self.get_evaluation_job(job_id)
+            if job.status == "completed":
+                if job.evaluation_report is None:
+                    raise ApiError(f"Evaluation job {job_id} completed without a report")
+                return job.evaluation_report
+            if job.status == "failed":
+                raise ApiError(job.error or f"Evaluation job {job_id} failed")
+            time.sleep(max(poll_interval, 0.0))
 
     def refine(
         self,
@@ -301,7 +496,8 @@ class Client:
                 When passing a ``RefineRequest``, keyword arguments are not accepted.
             **kwargs: Keyword arguments forwarded to ``RefineRequest``.  Required
                 keys: ``proposed_edits``, ``dev_tasks``, ``holdout_tasks``,
-                ``edit_budget``.  Optional: ``optimization_target``.
+                ``edit_budget``.  Optional: ``optimization_target``,
+                ``model_provider_keys``, ``model``.
 
         Returns:
             A ``RefineResult`` containing the refined package, accepted/rejected
@@ -320,7 +516,12 @@ class Client:
             )
             ```
         """
-        request = _coerce_refine_request(skill_package, **kwargs)
+        request = _coerce_refine_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = self._request_json(
             "POST",
             "/refine",
@@ -353,6 +554,30 @@ class Client:
             params={"month": month} if month else None,
         )
         return UsageSummary.model_validate(response)
+
+    def get_evaluations(self, limit: int = 50) -> EvaluationHistory:
+        """Fetch recent evaluation history for the authenticated organization.
+
+        Args:
+            limit: Maximum number of most-recent evaluation runs to return.
+
+        Returns:
+            An ``EvaluationHistory`` with recent runs, gate outcomes,
+            baseline metadata, and runtime summaries.
+
+        Example:
+            ```python
+            history = client.get_evaluations(limit=25)
+            print(history.evaluations[0].gate_result.status)
+            ```
+        """
+        response = self._request_json(
+            "GET",
+            "/app/evaluations",
+            headers=self._app_headers(),
+            params={"limit": limit},
+        )
+        return EvaluationHistory.model_validate(response)
 
     def create_api_key(self, label: str) -> IssuedApiKey:
         """Create a new tenant-owned API key.
@@ -458,6 +683,10 @@ class AsyncClient:
         base_url: API base URL.  Defaults to ``https://api.skillet.dev``.
         timeout: ``httpx`` request timeout in seconds.  Defaults to ``30.0``.
         http_client: Optional injected ``httpx.AsyncClient``.
+        model_provider_keys: Optional per-client provider API keys passed
+            through on every pipeline call unless overridden per request.
+        model: Optional default model passed through on every pipeline call
+            unless overridden per request.
 
     Example:
         ```python
@@ -478,9 +707,13 @@ class AsyncClient:
         base_url: str = "https://api.skillet.dev",
         timeout: float = 30.0,
         http_client: httpx.AsyncClient | None = None,
+        model_provider_keys: dict[str, str] | None = None,
+        model: str | None = None,
     ) -> None:
         self.api_key = api_key
         self.bearer_token = bearer_token
+        self.model_provider_keys = model_provider_keys
+        self.model = model
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -489,6 +722,20 @@ class AsyncClient:
         )
 
     async def aclose(self) -> None:
+        """Close the underlying ``httpx.AsyncClient`` when this instance owns it.
+
+        If you injected a custom ``http_client``, this method is a no-op and the
+        caller remains responsible for cleaning it up.
+
+        Example:
+            ```python
+            client = AsyncClient(api_key="sk_live_...")
+            try:
+                package = await client.build("Your corpus text here...")
+            finally:
+                await client.aclose()
+            ```
+        """
         if self._owns_client:
             await self._client.aclose()
 
@@ -537,38 +784,182 @@ class AsyncClient:
         corpus_text: str | BuildRequest,
         **kwargs: Any,
     ) -> SkillPackage:
-        """Async version of ``Client.build``.  See that method for full documentation."""
-        request = _coerce_build_request(corpus_text, **kwargs)
+        """Async version of ``Client.build``.
+
+        Use the same inputs as ``Client.build`` but ``await`` the network call.
+
+        Example:
+            ```python
+            package = await client.build(
+                "Instrumental variables help identify causal effects under endogeneity.",
+                bundle_target=2,
+                length_profile="moderate",
+            )
+            ```
+        """
+        request = _coerce_build_request(
+            corpus_text,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = await self._request_json(
             "POST",
             "/build",
             headers=self._pipeline_headers(),
-            json_body=request.model_dump(mode="json"),
+            json_body=request.model_dump(mode="json", exclude_none=True),
         )
         return SkillPackage.from_build_response(response)
 
     async def evaluate(
         self,
         skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        *,
+        poll_interval: float = 1.0,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> EvaluationReport:
-        """Async version of ``Client.evaluate``.  See that method for full documentation."""
-        request = _coerce_evaluate_request(skill_package, **kwargs)
+        """Async version of ``Client.evaluate``.
+
+        Use the same inputs as ``Client.evaluate`` but ``await`` the network call.
+
+        Example:
+            ```python
+            report = await client.evaluate(
+                package,
+                activation_policies=["forced", "autonomous"],
+                bundle_ablation=True,
+                length_ablation=True,
+            )
+            ```
+        """
+        request = _coerce_evaluate_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = await self._request_json(
             "POST",
             "/evaluate",
             headers=self._pipeline_headers(),
             json_body=request.to_api_payload(),
         )
-        return EvaluationReport.model_validate(response["evaluation_report"])
+        if isinstance(response, dict) and "evaluation_report" in response:
+            return EvaluationReport.model_validate(response["evaluation_report"])
+        submission = EvaluationJobSubmission.model_validate(response)
+        return await self.wait_for_evaluation(
+            submission.job_id,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+
+    async def submit_evaluation(
+        self,
+        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        **kwargs: Any,
+    ) -> EvaluationJobSubmission:
+        """Async version of ``Client.submit_evaluation``.
+
+        Submit an evaluation job and return immediately with the queued
+        ``job_id``.
+
+        Example:
+            ```python
+            submission = await client.submit_evaluation(
+                package,
+                activation_policies=["forced", "autonomous"],
+            )
+            print(submission.job_id)
+            ```
+        """
+        request = _coerce_evaluate_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
+        response = await self._request_json(
+            "POST",
+            "/evaluate",
+            headers=self._pipeline_headers(),
+            json_body=request.to_api_payload(),
+        )
+        return EvaluationJobSubmission.model_validate(response)
+
+    async def get_evaluation_job(self, job_id: str) -> EvaluationJob:
+        """Async version of ``Client.get_evaluation_job``.
+
+        Example:
+            ```python
+            job = await client.get_evaluation_job("evaljob_123")
+            print(job.status)
+            ```
+        """
+        response = await self._request_json(
+            "GET",
+            f"/evaluate/{job_id}",
+            headers=self._pipeline_headers(),
+        )
+        return EvaluationJob.model_validate(response)
+
+    async def wait_for_evaluation(
+        self,
+        job_id: str,
+        *,
+        poll_interval: float = 1.0,
+        timeout: float | None = None,
+    ) -> EvaluationReport:
+        """Async version of ``Client.wait_for_evaluation``.
+
+        Example:
+            ```python
+            submission = await client.submit_evaluation(package)
+            report = await client.wait_for_evaluation(submission.job_id, poll_interval=2.0)
+            print(report.metrics["pass_rate_delta"])
+            ```
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if deadline is not None and time.monotonic() > deadline:
+                raise ApiError(f"Timed out while waiting for evaluation job {job_id}")
+            job = await self.get_evaluation_job(job_id)
+            if job.status == "completed":
+                if job.evaluation_report is None:
+                    raise ApiError(f"Evaluation job {job_id} completed without a report")
+                return job.evaluation_report
+            if job.status == "failed":
+                raise ApiError(job.error or f"Evaluation job {job_id} failed")
+            await asyncio.sleep(max(poll_interval, 0.0))
 
     async def refine(
         self,
         skill_package: SkillPackage | RefineRequest | dict[str, Any],
         **kwargs: Any,
     ) -> RefineResult:
-        """Async version of ``Client.refine``.  See that method for full documentation."""
-        request = _coerce_refine_request(skill_package, **kwargs)
+        """Async version of ``Client.refine``.
+
+        Use the same inputs as ``Client.refine`` but ``await`` the network call.
+
+        Example:
+            ```python
+            refined = await client.refine(
+                package,
+                proposed_edits=[
+                    {"section": "decision_rules", "value": ["Abort weak IV runs when F < 10"]},
+                ],
+                dev_tasks=[{"task_id": "dev-1", "prompt": "Stop weak IV runs"}],
+                holdout_tasks=[{"task_id": "holdout-1", "prompt": "Stop weak IV runs"}],
+                edit_budget=1,
+            )
+            ```
+        """
+        request = _coerce_refine_request(
+            skill_package,
+            client_model_provider_keys=self.model_provider_keys,
+            client_model=self.model,
+            **kwargs,
+        )
         response = await self._request_json(
             "POST",
             "/refine",
@@ -578,7 +969,14 @@ class AsyncClient:
         return RefineResult.from_api_payload(response)
 
     async def get_usage(self, month: str | None = None) -> UsageSummary:
-        """Async version of ``Client.get_usage``.  See that method for full documentation."""
+        """Async version of ``Client.get_usage``.
+
+        Example:
+            ```python
+            usage = await client.get_usage(month="2026-03")
+            print(usage.remaining)
+            ```
+        """
         response = await self._request_json(
             "GET",
             "/app/usage",
@@ -587,8 +985,32 @@ class AsyncClient:
         )
         return UsageSummary.model_validate(response)
 
+    async def get_evaluations(self, limit: int = 50) -> EvaluationHistory:
+        """Async version of ``Client.get_evaluations``.
+
+        Example:
+            ```python
+            history = await client.get_evaluations(limit=25)
+            print(history.evaluations[0].baseline.status)
+            ```
+        """
+        response = await self._request_json(
+            "GET",
+            "/app/evaluations",
+            headers=self._app_headers(),
+            params={"limit": limit},
+        )
+        return EvaluationHistory.model_validate(response)
+
     async def create_api_key(self, label: str) -> IssuedApiKey:
-        """Async version of ``Client.create_api_key``.  See that method for full documentation."""
+        """Async version of ``Client.create_api_key``.
+
+        Example:
+            ```python
+            issued = await client.create_api_key("production-worker")
+            print(issued.secret)
+            ```
+        """
         response = await self._request_json(
             "POST",
             "/app/api-keys",
@@ -598,7 +1020,13 @@ class AsyncClient:
         return IssuedApiKey.model_validate(response)
 
     async def list_api_keys(self) -> list[ApiKeySummary]:
-        """Async version of ``Client.list_api_keys``.  See that method for full documentation."""
+        """Async version of ``Client.list_api_keys``.
+
+        Example:
+            ```python
+            keys = await client.list_api_keys()
+            ```
+        """
         response = await self._request_json(
             "GET",
             "/app/api-keys",
@@ -607,7 +1035,14 @@ class AsyncClient:
         return [ApiKeySummary.model_validate(item) for item in response]
 
     async def rotate_api_key(self, key_id: str) -> IssuedApiKey:
-        """Async version of ``Client.rotate_api_key``.  See that method for full documentation."""
+        """Async version of ``Client.rotate_api_key``.
+
+        Example:
+            ```python
+            rotated = await client.rotate_api_key("key_01abc")
+            print(rotated.secret)
+            ```
+        """
         response = await self._request_json(
             "POST",
             f"/app/api-keys/{key_id}/rotate",
@@ -616,7 +1051,14 @@ class AsyncClient:
         return IssuedApiKey.model_validate(response)
 
     async def revoke_api_key(self, key_id: str) -> ApiKeySummary:
-        """Async version of ``Client.revoke_api_key``.  See that method for full documentation."""
+        """Async version of ``Client.revoke_api_key``.
+
+        Example:
+            ```python
+            revoked = await client.revoke_api_key("key_01abc")
+            print(revoked.revoked_at)
+            ```
+        """
         response = await self._request_json(
             "DELETE",
             f"/app/api-keys/{key_id}",
