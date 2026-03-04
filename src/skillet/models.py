@@ -16,6 +16,56 @@ _MAX_PROVIDER_KEY_LENGTH = 256
 _MAX_PROVIDER_KEY_COUNT = 5
 
 
+def _infer_model_providers(model: str) -> tuple[str, ...] | None:
+    normalized = model.strip().lower()
+    if not normalized:
+        return None
+    explicit_prefixes = {
+        "openai/": ("openai",),
+        "anthropic/": ("anthropic",),
+        "azure/": ("azure",),
+        "bedrock/": ("bedrock",),
+        "gemini/": ("gemini", "google"),
+        "google/": ("google", "gemini"),
+    }
+    for prefix, providers in explicit_prefixes.items():
+        if normalized.startswith(prefix):
+            return providers
+    if normalized.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
+        return ("openai",)
+    if normalized.startswith("claude"):
+        return ("anthropic",)
+    if normalized.startswith("gemini"):
+        return ("gemini", "google")
+    return None
+
+
+def _validate_model_provider_contract(
+    *,
+    model: str | None,
+    model_provider_keys: dict[str, str] | None,
+) -> None:
+    if model is None:
+        return
+    inferred_providers = _infer_model_providers(model)
+    if inferred_providers is None:
+        raise ValueError(
+            "Could not infer a provider from `model`. "
+            "Use a recognized model name such as `gpt-5-nano`, "
+            "`claude-sonnet-4-20250514`, or `gemini-2.0-flash`."
+        )
+    if not model_provider_keys:
+        raise ValueError(
+            "`model_provider_keys` is required when `model` is set. "
+            f"Expected one of: {', '.join(inferred_providers)}."
+        )
+    if not any(provider in model_provider_keys for provider in inferred_providers):
+        raise ValueError(
+            "The inferred model provider is missing from `model_provider_keys`. "
+            f"Expected one of: {', '.join(inferred_providers)}."
+        )
+
+
 def _validate_model_provider_keys(
     keys: dict[str, str] | None,
 ) -> dict[str, str] | None:
@@ -178,6 +228,40 @@ class ComplexityReport(SkilletModel):
     pairwise_conflict_count: int = Field(default=0, description="Number of pairwise conflicts between skills.")
     complexity_gated_count: int = Field(default=0, description="Number of skills flagged as complexity-gated.")
     bundle_entropy: float = Field(default=0.0, description="Shannon entropy of skill topic distribution within the bundle.")
+
+
+class StructuredGenerationRequest(SkilletModel):
+    """Typed structured-generation request used by provider-backed build/refine stages."""
+
+    provider: str = Field(description="Resolved model provider for this request.")
+    model: str = Field(description="Concrete provider model identifier.")
+    system_prompt: str = Field(description="System instruction sent to the model.")
+    user_prompt: str = Field(description="User payload sent to the model.")
+    response_schema: dict[str, Any] = Field(description="JSON schema enforced on the response.")
+    temperature: float = Field(default=0.0, description="Sampling temperature for generation.")
+    max_output_tokens: int | None = Field(default=None, description="Optional maximum output tokens for the call.")
+
+
+class StructuredGenerationResult(SkilletModel):
+    """Normalized provider response for structured generation."""
+
+    provider: str = Field(description="Provider that executed the request.")
+    model: str = Field(description="Concrete provider model identifier.")
+    parsed_output: dict[str, Any] = Field(description="Schema-parsed structured output.")
+    raw_output: dict[str, Any] = Field(description="Provider response payload.")
+    usage: dict[str, Any] | None = Field(default=None, description="Normalized token usage payload, when available.")
+    provider_request_id: str | None = Field(default=None, description="Provider request identifier, when available.")
+
+
+class RefinementProposal(SkilletModel):
+    """Typed edit proposal emitted by the provider-backed refinement stage."""
+
+    skill_id: str = Field(description="Skill targeted by the proposal.")
+    section: EditableSection = Field(description="Editable section to modify.")
+    proposed_value: str | list[str] = Field(description="Candidate replacement value for the section.")
+    rationale: str = Field(description="Why this edit should help.")
+    evidence_refs: list[str] = Field(default_factory=list, description="Evaluation or source evidence supporting the edit.")
+    expected_effect: str = Field(description="Expected activation or pass-rate impact.")
 
 
 class RecommendedRuntimeProfile(SkilletModel):
@@ -432,8 +516,8 @@ class BuildRequest(SkilletModel):
     model_provider_keys: dict[str, str] | None = Field(
         default=None,
         description=(
-            "Optional LLM provider API keys for the model calls Skillet orchestrates. "
-            "Keys are pass-through only: held in memory for this request, never stored or logged. "
+            "Provider API keys for the structured extraction stage when `model` is set. "
+            "Keys are held in memory for this request only and never stored or logged. "
             "Accepted key names: `openai`, `gemini`, `anthropic`, etc."
         ),
     )
@@ -441,11 +525,10 @@ class BuildRequest(SkilletModel):
         default=None,
         max_length=128,
         description=(
-            "Optional model to use for LLM calls during this operation "
+            "Optional model identifier for provider-backed structured SkillIR extraction "
             "(e.g. `gpt-5-nano`, `claude-sonnet-4-20250514`, `gemini-2.0-flash`). "
-            "The provider is inferred from the model name and the corresponding key "
-            "must be present in `model_provider_keys`. "
-            "If omitted, defaults to a Skillet-selected model."
+            "If provided, the provider is inferred from the model name and a matching key must be present in "
+            "`model_provider_keys`."
         ),
     )
 
@@ -453,6 +536,14 @@ class BuildRequest(SkilletModel):
     @classmethod
     def validate_provider_keys(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return _validate_model_provider_keys(v)
+
+    @model_validator(mode="after")
+    def validate_model_provider_contract(self) -> "BuildRequest":
+        _validate_model_provider_contract(
+            model=self.model,
+            model_provider_keys=self.model_provider_keys,
+        )
+        return self
 
 
 class EvaluateRequest(SkilletModel):
@@ -568,6 +659,10 @@ class EvaluateRequest(SkilletModel):
             raise ValueError(
                 "baseline_eval_id is required when compare_to='explicit_baseline'"
             )
+        _validate_model_provider_contract(
+            model=self.model,
+            model_provider_keys=self.model_provider_keys,
+        )
         return self
 
     def to_api_payload(self) -> dict[str, Any]:
@@ -686,7 +781,7 @@ class RefineRequest(SkilletModel):
     )
     proposed_edits: list[ProposedSkillEdit] = Field(
         default_factory=list,
-        description="Ordered list of section edits to test against the dev partition.",
+        description="Optional caller-supplied section edits to test after model-backed proposal generation.",
     )
     dev_tasks: list[BenchmarkTask] = Field(
         min_length=1,
@@ -707,8 +802,8 @@ class RefineRequest(SkilletModel):
     model_provider_keys: dict[str, str] | None = Field(
         default=None,
         description=(
-            "Optional LLM provider API keys for the model calls Skillet orchestrates. "
-            "Keys are pass-through only: held in memory for this request, never stored or logged. "
+            "Provider API keys for the model-backed refinement proposal stage when `model` is set. "
+            "Keys are held in memory for this request only and never stored or logged. "
             "Accepted key names: `openai`, `gemini`, `anthropic`, etc."
         ),
     )
@@ -716,11 +811,10 @@ class RefineRequest(SkilletModel):
         default=None,
         max_length=128,
         description=(
-            "Optional model to use for LLM calls during refinement "
+            "Optional model identifier for provider-backed typed refinement proposals "
             "(e.g. `gpt-5-nano`, `claude-sonnet-4-20250514`, `gemini-2.0-flash`). "
-            "The provider is inferred from the model name and the corresponding key "
-            "must be present in `model_provider_keys`. "
-            "If omitted, defaults to a Skillet-selected model."
+            "If provided, the provider is inferred from the model name and a matching key must be present in "
+            "`model_provider_keys`."
         ),
     )
 
@@ -728,6 +822,14 @@ class RefineRequest(SkilletModel):
     @classmethod
     def validate_provider_keys(cls, v: dict[str, str] | None) -> dict[str, str] | None:
         return _validate_model_provider_keys(v)
+
+    @model_validator(mode="after")
+    def validate_model_provider_contract(self) -> "RefineRequest":
+        _validate_model_provider_contract(
+            model=self.model,
+            model_provider_keys=self.model_provider_keys,
+        )
+        return self
 
     def to_api_payload(self) -> dict[str, Any]:
         payload = {

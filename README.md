@@ -26,7 +26,7 @@ report = client.evaluate(package)
 result = client.refine(package, dev_tasks=[...], holdout_tasks=[...], edit_budget=3)
 ```
 
-## Passing Through Models And Provider Keys
+## Models And Provider Keys
 
 You can set a default model and provider keys once on the client:
 
@@ -48,6 +48,8 @@ result = client.refine(
     edit_budget=3,
 )
 ```
+
+`build` and `refine` use those settings for provider-backed structured extraction and refinement proposal generation. `evaluate` can also use them for provider-backed evaluation runs.
 
 Or override them per request:
 
