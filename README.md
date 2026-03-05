@@ -5,7 +5,7 @@ Python client for the Skillet API.
 ## Install
 
 ```bash
-pip install skillet
+python -m pip install skillet-sdk
 ```
 
 ## Quickstart
@@ -24,6 +24,18 @@ report = client.evaluate(package)
 
 # Refine
 result = client.refine(package, dev_tasks=[...], holdout_tasks=[...], edit_budget=3)
+```
+
+## Async Quickstart
+
+```python
+from skillet import AsyncClient
+
+async def run() -> None:
+    async with AsyncClient(api_key="sk-...") as client:
+        package = await client.build("Your corpus text here...")
+        report = await client.evaluate(package)
+        _ = report
 ```
 
 ## Models And Provider Keys
@@ -49,7 +61,7 @@ result = client.refine(
 )
 ```
 
-`build` and `refine` use those settings for provider-backed structured extraction and refinement proposal generation. `evaluate` can also use them for provider-backed evaluation runs.
+`build`, `evaluate`, and `refine` use those settings unless you override them per request.
 
 Or override them per request:
 
@@ -76,4 +88,4 @@ result = client.refine(
 )
 ```
 
-The same fields are also available on `BuildRequest`, `EvaluateRequest`, and `RefineRequest`.
+The same fields are available on `BuildRequest`, `EvaluateRequest`, and `RefineRequest`.

@@ -6,10 +6,17 @@ on:
     paths:
       - "src/skillet/**"
       - "pyproject.toml"
+      - "README.md"
+  workflow_dispatch:
+
+concurrency:
+  group: docs-sync-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   regenerate-docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -21,11 +28,14 @@ jobs:
           token: ${{ secrets.SKILLET_REPO_PAT }}
           path: skillet
           ref: main
+          persist-credentials: false
 
       - name: Check out skillet-python repo
         uses: actions/checkout@v4
         with:
           path: skillet-python
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -45,6 +55,8 @@ jobs:
 
       - name: Commit regenerated docs artifacts
         working-directory: ./skillet
+        env:
+          SKILLET_REPO_PAT: ${{ secrets.SKILLET_REPO_PAT }}
         run: |
           if git diff --quiet -- docs/api/openapi.json frontend/src/generated/docsReference.json docs/internal/docs-sources.json; then
             echo "No docs artifact changes."
@@ -54,4 +66,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/api/openapi.json frontend/src/generated/docsReference.json docs/internal/docs-sources.json
           git commit -m "chore: regenerate docs artifacts from skillet-python [skip ci]"
+          git remote set-url origin https://x-access-token:${SKILLET_REPO_PAT}@github.com/skilletdev/skillet.git
           git push origin HEAD:main
