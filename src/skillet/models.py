@@ -44,7 +44,10 @@ def _validate_model_provider_contract(
     *,
     model: str | None,
     model_provider_keys: dict[str, str] | None,
+    require_model: bool = False,
 ) -> None:
+    if require_model and model is None:
+        raise ValueError("`model` is required.")
     if model is None:
         return
     inferred_providers = _infer_model_providers(model)
@@ -238,7 +241,7 @@ class StructuredGenerationRequest(SkilletModel):
     system_prompt: str = Field(description="System instruction sent to the model.")
     user_prompt: str = Field(description="User payload sent to the model.")
     response_schema: dict[str, Any] = Field(description="JSON schema enforced on the response.")
-    temperature: float = Field(default=0.0, description="Sampling temperature for generation.")
+    temperature: float | None = Field(default=None, description="Optional sampling temperature for providers that support it.")
     max_output_tokens: int | None = Field(default=None, description="Optional maximum output tokens for the call.")
 
 

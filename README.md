@@ -14,7 +14,11 @@ python -m pip install skillet-sdk
 from skillet import Client
 
 client = Client(api_key="sk-...")
-package = client.build("Your corpus text here...")
+package = client.build(
+    "Your corpus text here...",
+    model="gpt-5-nano",
+    model_provider_keys={"openai": "sk-openai-key"},
+)
 
 # Export to disk
 package.bundle().extract_to("./my-skill")
