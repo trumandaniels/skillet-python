@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .exceptions import SkilletError
-from .models import EvaluationReport, RefineResult, SkillDraft, SkillPackage
+from .models import BuildArtifact, EvaluationReport, RefineResult, SkillDraft, SkillPackage
 
 
 class SkillSession:
@@ -36,6 +36,7 @@ class SkillSession:
     def __init__(self, client: Any) -> None:
         self.client = client
         self.draft: SkillDraft | None = None
+        self.build_artifact: BuildArtifact | None = None
         self.skill_package: SkillPackage | None = None
         self.evaluation_report: EvaluationReport | None = None
         self.refine_result: RefineResult | None = None
@@ -50,7 +51,8 @@ class SkillSession:
             corpus_text: Raw domain corpus as a string, or a pre-built ``SkillDraft``.
             **kwargs: Forwarded to ``SkillDraft`` when ``corpus_text`` is a string.
                 Accepted keys: ``overlap_ratio``, ``target_runtime``, ``bundle_target``,
-                ``length_profile``, ``emit_scripts``, ``emit_checks``.
+                ``length_profile``, ``emit_scripts``, ``emit_checks``, ``mode``,
+                and ``target_outcome``.
 
         Returns:
             ``self``, so calls can be chained.
@@ -72,33 +74,35 @@ class SkillSession:
             self.draft = SkillDraft.from_corpus(corpus_text, **kwargs)
         return self
 
-    def build(self, draft: SkillDraft | None = None) -> SkillPackage:
-        """Build the stored draft (or a supplied draft) into a ``SkillPackage``.
+    def build(self, draft: SkillDraft | None = None) -> BuildArtifact:
+        """Build the stored draft (or a supplied draft) into a ``BuildArtifact``.
 
         Calls ``POST /build`` via the underlying client and stores the result on
-        the session as ``self.skill_package``.
+        the session as ``self.build_artifact``. ``self.skill_package`` is only
+        populated when the artifact type is a normal `skill`.
 
         Args:
             draft: Optional ``SkillDraft`` to build instead of the one stored by
                 ``from_corpus()``.
 
         Returns:
-            The built ``SkillPackage``.
+            The built ``BuildArtifact``.
 
         Raises:
             SkilletError: If no draft has been set and none is supplied.
 
         Example:
             ```python
-            package = session.build()
+            artifact = session.build()
             ```
         """
         if draft is not None:
             self.draft = draft
         if self.draft is None:
             raise SkilletError("Call from_corpus() or pass a SkillDraft before build()")
-        self.skill_package = self.client.build(self.draft.to_request())
-        return self.skill_package
+        self.build_artifact = self.client.build(self.draft.to_request())
+        self.skill_package = self.build_artifact.skill_package if self.build_artifact.is_skill else None
+        return self.build_artifact
 
     def evaluate(
         self,
@@ -119,7 +123,7 @@ class SkillSession:
             The ``EvaluationReport``.
 
         Raises:
-            SkilletError: If no package is available and none is supplied.
+            SkilletError: If no normal skill package is available and none is supplied.
 
         Example:
             ```python
@@ -152,7 +156,7 @@ class SkillSession:
             The ``RefineResult``.
 
         Raises:
-            SkilletError: If no package is available and none is supplied.
+            SkilletError: If no normal skill package is available and none is supplied.
 
         Example:
             ```python
@@ -170,5 +174,3 @@ class SkillSession:
         self.refine_result = self.client.refine(package, **kwargs)
         self.skill_package = self.refine_result.refined_skill_package
         return self.refine_result
-
-

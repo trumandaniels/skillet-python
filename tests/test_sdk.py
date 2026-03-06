@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from skillet import (
     ApiError,
@@ -14,6 +15,8 @@ from skillet import (
     AuthenticationError,
     AuthorizationError,
     BenchmarkTask,
+    BuildArtifact,
+    BuildMode,
     BuildRequest,
     Client,
     EvaluateRequest,
@@ -45,9 +48,39 @@ def _skill_package_payload() -> dict[str, object]:
 
 def _build_response() -> dict[str, object]:
     return {
+        "artifact_type": "skill",
+        "mode": "auto",
+        "resolved_mode": "extract",
+        "corpus_class": "strong_procedural",
+        "confidence": "high",
+        "summary": "The corpus contains strong procedural evidence that supports direct skill extraction.",
+        "evidence_reasons": ["strong_procedural_density"],
+        "source_refs": ["sample#1"],
         "skill_package": _skill_package_payload(),
         "risk_flags": [],
         "activation_terms": ["sample"],
+    }
+
+
+def _unsupported_build_response() -> dict[str, object]:
+    return {
+        "artifact_type": "unsupported",
+        "mode": "extract",
+        "resolved_mode": "extract",
+        "corpus_class": "descriptive",
+        "confidence": "low",
+        "summary": "The corpus is primarily descriptive.",
+        "evidence_reasons": ["descriptive_or_nonprocedural"],
+        "source_refs": [],
+        "skill_package": None,
+        "reference_pack": None,
+        "unsupported": {
+            "code": "unsupported_for_skill_extraction",
+            "message": "The corpus does not contain strong enough procedural evidence for extraction.",
+            "suggested_next_step": "Use synthesize mode with an explicit target_outcome.",
+            "reasons": ["descriptive_or_nonprocedural"],
+            "source_refs": [],
+        },
     }
 
 
@@ -417,8 +450,8 @@ def test_bundle_extract_to_rejects_file_target(tmp_path: Path) -> None:
 
 def test_skill_session_build_evaluate_refine_flow() -> None:
     class FakeClient:
-        def build(self, _: object) -> SkillPackage:
-            return _minimal_package()
+        def build(self, _: object) -> BuildArtifact:
+            return BuildArtifact.from_api_payload(_build_response())
 
         def evaluate(self, _: SkillPackage, **__: object) -> object:
             from skillet import EvaluationReport
@@ -439,6 +472,34 @@ def test_skill_session_build_evaluate_refine_flow() -> None:
         edit_budget=1,
     )
 
-    assert built.bundle_name == "sample-bundle"
+    assert built.artifact_type == "skill"
+    assert built.skill_package is not None
+    assert built.skill_package.bundle_name == "sample-bundle"
     assert report.metrics["pass_rate_delta"] == 0.1
     assert refined.holdout_safety_result.accepted is True
+
+
+def test_build_returns_typed_artifact() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_build_response())
+
+    client = _make_sync_client(handler)
+    artifact = client.build("corpus")
+
+    assert isinstance(artifact, BuildArtifact)
+    assert artifact.artifact_type == "skill"
+    assert artifact.skill_package is not None
+    assert artifact.skill_package.bundle_name == "sample-bundle"
+
+
+def test_build_request_requires_target_outcome_for_synthesize() -> None:
+    with pytest.raises(PydanticValidationError):
+        BuildRequest(corpus_text="corpus", mode=BuildMode.SYNTHESIZE)
+
+
+def test_evaluate_rejects_non_skill_build_artifact() -> None:
+    client = _make_sync_client(lambda _: httpx.Response(200, json={"evaluation_report": {"metrics": {}}}))
+    artifact = BuildArtifact.from_api_payload(_unsupported_build_response())
+
+    with pytest.raises(ValidationError, match="normal skill package"):
+        client.evaluate(artifact)

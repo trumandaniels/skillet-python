@@ -16,6 +16,7 @@ from .exceptions import (
 )
 from .models import (
     ApiKeySummary,
+    BuildArtifact,
     BuildRequest,
     EvaluateRequest,
     EvaluationHistory,
@@ -95,15 +96,20 @@ def _coerce_build_request(
 
 
 def _coerce_skill_package(
-    skill_package: SkillPackage | dict[str, Any],
+    skill_package: BuildArtifact | SkillPackage | dict[str, Any],
 ) -> SkillPackage:
+    if isinstance(skill_package, BuildArtifact):
+        try:
+            return skill_package.require_skill_package()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
     if isinstance(skill_package, SkillPackage):
         return skill_package
     return SkillPackage.from_api_payload(skill_package)
 
 
 def _coerce_evaluate_request(
-    skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+    skill_package: BuildArtifact | SkillPackage | EvaluateRequest | dict[str, Any],
     *,
     client_model_provider_keys: dict[str, str] | None = None,
     client_model: str | None = None,
@@ -128,7 +134,7 @@ def _coerce_evaluate_request(
 
 
 def _coerce_refine_request(
-    skill_package: SkillPackage | RefineRequest | dict[str, Any],
+    skill_package: BuildArtifact | SkillPackage | RefineRequest | dict[str, Any],
     *,
     client_model_provider_keys: dict[str, str] | None = None,
     client_model: str | None = None,
@@ -277,8 +283,8 @@ class Client:
         self,
         corpus_text: str | BuildRequest,
         **kwargs: Any,
-    ) -> SkillPackage:
-        """Build a ``SkillPackage`` from raw corpus text.
+    ) -> BuildArtifact:
+        """Build a typed artifact from raw corpus text.
 
         Use this when you already have corpus text as a single string and want
         direct control over build options without using ``SkillSession``.
@@ -287,14 +293,14 @@ class Client:
             corpus_text: Raw domain corpus as a string, or a pre-validated
                 ``BuildRequest`` object.  When passing a ``BuildRequest``,
                 keyword arguments are not accepted.
-            **kwargs: Keyword arguments forwarded to ``BuildRequest``.  Accepted
-                keys: ``overlap_ratio``, ``target_runtime``, ``bundle_target``,
-                ``length_profile``, ``emit_scripts``, ``emit_checks``,
-                ``model_provider_keys``, ``model``.
+            **kwargs: Keyword arguments forwarded to ``BuildRequest``. Accepted
+                keys include ``overlap_ratio``, ``target_runtime``, ``bundle_target``,
+                ``length_profile``, ``emit_scripts``, ``emit_checks``, ``mode``,
+                ``target_outcome``, ``model_provider_keys``, and ``model``.
 
         Returns:
-            A ``SkillPackage`` containing the compiled skills, bundle manifest,
-            complexity report, risk flags, and recommended runtime profile.
+            A ``BuildArtifact`` describing whether the corpus yielded a normal
+            skill, a draft skill, a reference pack, or an unsupported outcome.
 
         Example:
             ```python
@@ -317,11 +323,11 @@ class Client:
             headers=self._pipeline_headers(),
             json_body=request.model_dump(mode="json", exclude_none=True),
         )
-        return SkillPackage.from_build_response(response)
+        return BuildArtifact.from_api_payload(response)
 
     def evaluate(
         self,
-        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | EvaluateRequest | dict[str, Any],
         *,
         poll_interval: float = 1.0,
         timeout: float | None = None,
@@ -333,7 +339,7 @@ class Client:
         over activation policies and ablations.
 
         Args:
-            skill_package: A ``SkillPackage``, ``EvaluateRequest``, or a raw
+            skill_package: A ``BuildArtifact``, ``SkillPackage``, ``EvaluateRequest``, or a raw
                 ``dict`` containing a package payload.  When passing an
                 ``EvaluateRequest``, keyword arguments are not accepted.
             **kwargs: Keyword arguments forwarded to ``EvaluateRequest``.  Accepted
@@ -381,7 +387,7 @@ class Client:
 
     def submit_evaluation(
         self,
-        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | EvaluateRequest | dict[str, Any],
         **kwargs: Any,
     ) -> EvaluationJobSubmission:
         """Submit an evaluation job without waiting for completion.
@@ -482,7 +488,7 @@ class Client:
 
     def refine(
         self,
-        skill_package: SkillPackage | RefineRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | RefineRequest | dict[str, Any],
         **kwargs: Any,
     ) -> RefineResult:
         """Apply constrained edits to a package and revalidate against dev and holdout tasks.
@@ -492,7 +498,7 @@ class Client:
         optimization target without regressing holdout safety.
 
         Args:
-            skill_package: A ``SkillPackage``, ``RefineRequest``, or raw ``dict``.
+            skill_package: A ``BuildArtifact``, ``SkillPackage``, ``RefineRequest``, or raw ``dict``.
                 When passing a ``RefineRequest``, keyword arguments are not accepted.
             **kwargs: Keyword arguments forwarded to ``RefineRequest``.  Required
                 keys: ``proposed_edits``, ``dev_tasks``, ``holdout_tasks``,
@@ -783,7 +789,7 @@ class AsyncClient:
         self,
         corpus_text: str | BuildRequest,
         **kwargs: Any,
-    ) -> SkillPackage:
+    ) -> BuildArtifact:
         """Async version of ``Client.build``.
 
         Use the same inputs as ``Client.build`` but ``await`` the network call.
@@ -809,11 +815,11 @@ class AsyncClient:
             headers=self._pipeline_headers(),
             json_body=request.model_dump(mode="json", exclude_none=True),
         )
-        return SkillPackage.from_build_response(response)
+        return BuildArtifact.from_api_payload(response)
 
     async def evaluate(
         self,
-        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | EvaluateRequest | dict[str, Any],
         *,
         poll_interval: float = 1.0,
         timeout: float | None = None,
@@ -856,7 +862,7 @@ class AsyncClient:
 
     async def submit_evaluation(
         self,
-        skill_package: SkillPackage | EvaluateRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | EvaluateRequest | dict[str, Any],
         **kwargs: Any,
     ) -> EvaluationJobSubmission:
         """Async version of ``Client.submit_evaluation``.
@@ -934,7 +940,7 @@ class AsyncClient:
 
     async def refine(
         self,
-        skill_package: SkillPackage | RefineRequest | dict[str, Any],
+        skill_package: BuildArtifact | SkillPackage | RefineRequest | dict[str, Any],
         **kwargs: Any,
     ) -> RefineResult:
         """Async version of ``Client.refine``.

@@ -111,6 +111,31 @@ class LengthProfile(StrEnum):
     DETAILED = "detailed"
 
 
+class BuildMode(StrEnum):
+    """How Skillet should interpret the corpus during build."""
+
+    EXTRACT = "extract"
+    SYNTHESIZE = "synthesize"
+    AUTO = "auto"
+
+
+class ArtifactType(StrEnum):
+    """Top-level artifact emitted by the build pipeline."""
+
+    SKILL = "skill"
+    DRAFT_SKILL = "draft_skill"
+    REFERENCE_PACK = "reference_pack"
+    UNSUPPORTED = "unsupported"
+
+
+class CorpusClass(StrEnum):
+    """Classification of procedural evidence in the supplied corpus."""
+
+    STRONG_PROCEDURAL = "strong_procedural"
+    WEAK_PROCEDURAL = "weak_procedural"
+    DESCRIPTIVE = "descriptive"
+
+
 class ActivationPolicy(StrEnum):
     """How the skill is presented to the agent during evaluation."""
 
@@ -477,6 +502,59 @@ class SkillPackage(SkilletModel):
         )
         return target
 
+
+class BuildArtifact(SkilletModel):
+    """Canonical response object returned by ``client.build()``."""
+
+    artifact_type: ArtifactType = Field(description="Top-level artifact produced by the build pipeline.")
+    mode: BuildMode = Field(description="Requested build mode.")
+    resolved_mode: BuildMode = Field(description="Mode actually used after routing.")
+    corpus_class: CorpusClass = Field(description="Classifier output describing procedural evidence strength.")
+    confidence: str = Field(description="Confidence label for the returned artifact.")
+    summary: str | None = Field(default=None, description="Short human-readable summary of the build outcome.")
+    evidence_reasons: list[str] = Field(default_factory=list, description="Machine-readable reasons that drove routing.")
+    source_refs: list[str] = Field(default_factory=list, description="Corpus references used to justify the artifact.")
+    target_outcome: str | None = Field(default=None, description="Requested target outcome for synthesis, when supplied.")
+    skill_package: SkillPackage | None = Field(default=None, description="Compiled skill package when the artifact is `skill` or `draft_skill`.")
+    reference_pack: dict[str, Any] | None = Field(default=None, description="Structured reference output when the artifact is `reference_pack`.")
+    unsupported: dict[str, Any] | None = Field(default=None, description="Structured explanation when the artifact is `unsupported`.")
+    bundle_manifest: BundleManifest | None = Field(default=None, description="Bundle-level manifest when a skill-like artifact is produced.")
+    complexity_report: ComplexityReport | None = Field(default=None, description="Complexity diagnostics for skill-like artifacts.")
+    risk_flags: list[str] = Field(default_factory=list, description="Build-time risk indicators.")
+    activation_terms: list[str] = Field(default_factory=list, description="Suggested retrieval and activation terms.")
+    recommended_runtime_profile: RecommendedRuntimeProfile | None = Field(default=None, description="Recommended runtime defaults for skill-like artifacts.")
+
+    @classmethod
+    def from_api_payload(cls, payload: dict[str, Any]) -> BuildArtifact:
+        data = dict(payload)
+        if data.get("skill_package") is not None:
+            data["skill_package"] = SkillPackage.from_api_payload(data["skill_package"])
+        if data.get("bundle_manifest") is not None:
+            data["bundle_manifest"] = BundleManifest.model_validate(data["bundle_manifest"])
+        if data.get("complexity_report") is not None:
+            data["complexity_report"] = ComplexityReport.model_validate(data["complexity_report"])
+        if data.get("recommended_runtime_profile") is not None:
+            data["recommended_runtime_profile"] = RecommendedRuntimeProfile.model_validate(
+                data["recommended_runtime_profile"]
+            )
+        return cls.model_validate(data)
+
+    @property
+    def is_skill(self) -> bool:
+        return self.artifact_type == ArtifactType.SKILL and self.skill_package is not None
+
+    @property
+    def is_draft_skill(self) -> bool:
+        return self.artifact_type == ArtifactType.DRAFT_SKILL and self.skill_package is not None
+
+    def require_skill_package(self) -> SkillPackage:
+        if not self.is_skill or self.skill_package is None:
+            raise ValueError(
+                f"Build artifact type `{self.artifact_type}` cannot be used where a normal skill package is required."
+            )
+        return self.skill_package
+
+
 class BuildRequest(SkilletModel):
     """Full build payload for ``client.build(...)``.
 
@@ -516,6 +594,15 @@ class BuildRequest(SkilletModel):
         default=True,
         description="Whether to generate verification check artifacts.",
     )
+    mode: BuildMode = Field(
+        default=BuildMode.AUTO,
+        description="How to interpret the corpus: extract an existing procedure, synthesize a draft, or auto-route.",
+    )
+    target_outcome: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Explicit goal for synthesis. Required when `mode='synthesize'`.",
+    )
     model_provider_keys: dict[str, str] | None = Field(
         default=None,
         description=(
@@ -542,6 +629,8 @@ class BuildRequest(SkilletModel):
 
     @model_validator(mode="after")
     def validate_model_provider_contract(self) -> "BuildRequest":
+        if self.mode == BuildMode.SYNTHESIZE and not self.target_outcome:
+            raise ValueError("target_outcome is required when mode='synthesize'")
         _validate_model_provider_contract(
             model=self.model,
             model_provider_keys=self.model_provider_keys,
@@ -1145,6 +1234,8 @@ class SkillDraft(SkilletModel):
     length_profile: LengthProfile = Field(default=LengthProfile.MODERATE, description="Verbosity level of generated skill documents.")
     emit_scripts: bool = Field(default=True, description="Whether to generate executable script artifacts.")
     emit_checks: bool = Field(default=True, description="Whether to generate verification check artifacts.")
+    mode: BuildMode = Field(default=BuildMode.AUTO, description="How the build should interpret the corpus.")
+    target_outcome: str | None = Field(default=None, min_length=1, description="Explicit target outcome for synthesis mode.")
 
     @classmethod
     def from_corpus(cls, corpus_text: str, **kwargs: Any) -> SkillDraft:
